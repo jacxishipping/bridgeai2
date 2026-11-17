@@ -409,3 +409,29 @@ def test_secure_desktop_name_rule():
     # (non-"Default") rule catches it, matching the C++ helper.
     assert screen_capture.is_secure_desktop_name("Screen-saver") is True
     assert screen_capture.is_secure_desktop_name("") is False
+
+
+def test_legacy_webrtc_session_error_preserves_deprecation_headers(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from ai_bridge.control.app import create_app
+
+    app = create_app(admin_token="adm-dep", db_path=tmp_path / "dep.db")
+    client = TestClient(app)
+    headers = {"x-admin-token": "adm-dep"}
+
+    monkeypatch.setenv("AI_BRIDGE_PROFILE", "production")
+    monkeypatch.setenv("AI_BRIDGE_CSRF_SECRET", "test-csrf-secret")
+    monkeypatch.delenv("AI_BRIDGE_ALLOW_LEGACY_WEBRTC", raising=False)
+    r410 = client.post("/api/devices/local/desktop/webrtc/session", headers=headers, json={"fps": 15})
+    assert r410.status_code == 410
+    assert r410.headers.get("deprecation") == "true"
+    assert "v1/sessions" in (r410.headers.get("link") or "")
+    assert r410.headers.get("sunset") == "legacy-webrtc-session-route"
+
+    monkeypatch.setenv("AI_BRIDGE_ALLOW_LEGACY_WEBRTC", "1")
+    r404 = client.post("/api/devices/nonexistent-dev/desktop/webrtc/session", headers=headers, json={"fps": 15})
+    assert r404.status_code == 404
+    assert r404.headers.get("deprecation") == "true"
+    assert "v1/sessions" in (r404.headers.get("link") or "")
+    assert r404.headers.get("sunset") == "legacy-webrtc-session-route"

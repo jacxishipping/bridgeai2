@@ -154,8 +154,17 @@ def update_fleet_agent(
         )
     manifest, signature_b64 = updates.load_signed_manifest()
     public_key_path = Path(os.environ[updates.UPDATE_PUBLIC_KEY_ENV])
+    if repo_dir:
+        target_repo = Path(repo_dir)
+    else:
+        env_repo = os.environ.get("AI_BRIDGE_REPO_DIR", "").strip()
+        if env_repo:
+            target_repo = Path(env_repo)
+        else:
+            pkg_root = Path(__file__).resolve().parents[3]
+            target_repo = pkg_root if (pkg_root / ".git").exists() else Path.cwd()
     result = updates.apply_pinned_git_update(
-        Path(repo_dir) if repo_dir else Path.cwd(),
+        target_repo,
         manifest, signature_b64, public_key_path,
     )
     return {

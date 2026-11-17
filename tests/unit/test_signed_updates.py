@@ -192,3 +192,19 @@ def test_child_env_contains_only_allowlist(monkeypatch):
     for leaked in ("DATABASE_URL", "AI_BRIDGE_VAULT_TOKEN", "AI_BRIDGE_TURN_SECRET",
                    "AI_BRIDGE_DEVICE_TOKEN", "SOME_WEBHOOK_URL", "OPENAI_API_KEY"):
         assert leaked not in seen
+
+
+def test_update_fleet_agent_uses_env_repo_dir(tmp_path, monkeypatch):
+    repo, sha1, sha2 = _make_repo(tmp_path)
+    assert _git(repo, "checkout", "-f", sha1).returncode == 0
+    manifest = {"name": "ai-bridge", "version": "0.3.0", "commit": sha2, "files": []}
+    manifest_path, sig_path, pub = _write_signed(tmp_path, manifest)
+    _configure(monkeypatch, tmp_path, manifest_path, sig_path, pub)
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    monkeypatch.setenv("AI_BRIDGE_REPO_DIR", str(repo))
+    monkeypatch.chdir(tmp_path)
+
+    result = tools.update_fleet_agent(approval_granted=True, policy=POLICY)
+    assert result["ok"] is True
+    assert result["stdout"] == sha2
+    assert _head(repo) == sha2

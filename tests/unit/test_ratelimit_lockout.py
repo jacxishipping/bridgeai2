@@ -245,3 +245,71 @@ def test_window_slides_as_admitted_entries_age_out(lockout_env):
     assert durable_ratelimit.allow("slide", 2, 60.0) is True
     assert durable_ratelimit.allow("slide", 2, 60.0) is True
     assert durable_ratelimit.allow("slide", 2, 60.0) is False
+
+
+def test_db_allow_is_atomic_under_concurrency(tmp_path):
+    """F-05-08: concurrent _db_allow calls must never over-admit past limit."""
+    import concurrent.futures
+    import sqlite3
+
+    db_path = tmp_path / "rl.db"
+    setup_conn = sqlite3.connect(str(db_path))
+    setup_conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
+    setup_conn.commit()
+    setup_conn.close()
+
+    def _hit(_i):
+        c = sqlite3.connect(str(db_path), timeout=30)
+        try:
+            return durable_ratelimit._db_allow(c, "concurrent-key", limit=5, window=60.0)
+        finally:
+            c.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+        results = list(pool.map(_hit, range(20)))
+    assert results.count(True) == 5
+    assert results.count(False) == 15
+
+
+def test_db_allow_postgres_uses_for_update_in_transaction():
+    """F-05-08: Postgres path seeds row with ON CONFLICT DO NOTHING and locks with FOR UPDATE."""
+    import contextlib
+    import json
+
+    class _FakePgConn:
+        dialect = "postgres"
+
+        def __init__(self):
+            self.sqls = []
+            self.store = {}
+
+        @contextlib.contextmanager
+        def transaction(self):
+            self.sqls.append("BEGIN")
+            yield
+            self.sqls.append("COMMIT")
+
+        def execute(self, sql, params=()):
+            self.sqls.append(sql)
+            class _Res:
+                def __init__(self, row):
+                    self._row = row
+                def fetchone(self):
+                    return self._row
+            if sql.startswith("INSERT INTO settings"):
+                self.store.setdefault(params[0], params[1])
+                return _Res(None)
+            if "FOR UPDATE" in sql:
+                return _Res((self.store[params[0]],))
+            if sql.startswith("UPDATE settings"):
+                self.store[params[1]] = params[0]
+                return _Res(None)
+            return _Res(None)
+
+    pg = _FakePgConn()
+    assert durable_ratelimit._db_allow(pg, "pg-key", limit=2, window=60.0) is True
+    assert durable_ratelimit._db_allow(pg, "pg-key", limit=2, window=60.0) is True
+    assert durable_ratelimit._db_allow(pg, "pg-key", limit=2, window=60.0) is False
+    assert any("FOR UPDATE" in s for s in pg.sqls)
+    assert any("ON CONFLICT(key) DO NOTHING" in s for s in pg.sqls)
+    assert json.loads(pg.store["ratelimit.pg-key"])["count"] == 2

@@ -220,40 +220,94 @@ def _redis_allow(key: str, limit: int, window: float) -> bool | None:
         return None
 
 
+_DB_ALLOW_LOCK = threading.Lock()
+
+
 def _db_allow(conn: Any, key: str, limit: int, window: float) -> bool:
+    """Atomic DB rate-limit check/increment (F-05-08).
+
+    Serializes in-process callers with ``_DB_ALLOW_LOCK``, uses ``SELECT ...
+    FOR UPDATE`` inside a transaction on Postgres (with ``ON CONFLICT DO
+    NOTHING`` row seeding so concurrent workers serialize on the row lock),
+    and ``BEGIN IMMEDIATE`` on SQLite so cross-process writers cannot race.
+    """
     setting_key = f"ratelimit.{key}"
     now = time.time()
-    row = conn.execute("SELECT value FROM settings WHERE key=?", (setting_key,)).fetchone()
-    raw = None
-    if row is not None:
-        raw = row["value"] if hasattr(row, "keys") else row[0]
-    data: dict[str, Any] = {"t0": now, "count": 0}
-    if raw:
-        try:
-            data = json.loads(str(raw))
-        except json.JSONDecodeError:
-            data = {"t0": now, "count": 0}
-    t0 = float(data.get("t0") or now)
-    count = int(data.get("count") or 0)
-    if now - t0 >= window:
-        t0 = now
-        count = 0
-    if count >= limit:
-        conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (setting_key, json.dumps({"t0": t0, "count": count})),
-        )
-        conn.commit()
-        return False
-    count += 1
-    conn.execute(
-        "INSERT INTO settings (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (setting_key, json.dumps({"t0": t0, "count": count})),
+    is_pg = (
+        getattr(conn, "dialect", None) == "postgres"
+        or "pg" in type(conn).__name__.lower()
     )
-    conn.commit()
-    return True
+
+    def _eval_and_write(raw: Any) -> tuple[bool, str]:
+        data: dict[str, Any] = {"t0": now, "count": 0}
+        if raw:
+            try:
+                data = json.loads(str(raw))
+            except json.JSONDecodeError:
+                data = {"t0": now, "count": 0}
+        t0 = float(data.get("t0") or now)
+        count = int(data.get("count") or 0)
+        if now - t0 >= window:
+            t0 = now
+            count = 0
+        if count >= limit:
+            return False, json.dumps({"t0": t0, "count": count})
+        count += 1
+        return True, json.dumps({"t0": t0, "count": count})
+
+    with _DB_ALLOW_LOCK:
+        if is_pg:
+            txn = getattr(conn, "transaction", None)
+            if txn is not None:
+                with txn():
+                    conn.execute(
+                        "INSERT INTO settings (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO NOTHING",
+                        (setting_key, json.dumps({"t0": now, "count": 0})),
+                    )
+                    row = conn.execute(
+                        "SELECT value FROM settings WHERE key=? FOR UPDATE",
+                        (setting_key,),
+                    ).fetchone()
+                    raw = (row["value"] if hasattr(row, "keys") else row[0]) if row is not None else None
+                    admitted, new_val = _eval_and_write(raw)
+                    if admitted:
+                        conn.execute(
+                            "UPDATE settings SET value=? WHERE key=?",
+                            (new_val, setting_key),
+                        )
+                    return admitted
+        # SQLite (or generic DB-API connection without transaction())
+        raw_conn = getattr(conn, "_conn", conn)
+        began = False
+        try:
+            raw_conn.execute("BEGIN IMMEDIATE")
+            began = True
+        except Exception as exc:
+            if "cannot start a transaction within a transaction" not in str(exc).lower():
+                began = False
+        try:
+            row = conn.execute("SELECT value FROM settings WHERE key=?", (setting_key,)).fetchone()
+            raw = (row["value"] if hasattr(row, "keys") else row[0]) if row is not None else None
+            admitted, new_val = _eval_and_write(raw)
+            if admitted:
+                conn.execute(
+                    "INSERT INTO settings (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (setting_key, new_val),
+                )
+            if began:
+                raw_conn.commit()
+            else:
+                conn.commit()
+            return admitted
+        except Exception:
+            if began:
+                try:
+                    raw_conn.rollback()
+                except Exception:
+                    pass
+            raise
 
 
 def allow(key: str, limit: int, window: float = 60.0, *, conn: Any | None = None) -> bool:

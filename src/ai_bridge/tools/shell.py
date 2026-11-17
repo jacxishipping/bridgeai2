@@ -184,10 +184,36 @@ def _run_cwd(working_directory: str, *, is_admin: bool, policy: Policy | None) -
         raise
 
 
+def _terminate_proc_tree(proc: subprocess.Popen[str]) -> None:
+    """Terminate *proc* and its process group/tree, draining pipes best-effort."""
+    terminate_process_group(proc, grace_seconds=2.0)
+    # Windows second-chance: terminate_process_group runs taskkill /F /T once
+    # and returns without verifying; if the process survived, try once more.
+    if os.name == "nt" and proc.poll() is None:
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                shell=False,
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    try:
+        proc.communicate(timeout=5)
+    except Exception:
+        pass
+
+
 def _run_argv(argv: list[str], cwd: str | None, timeout_arg: int) -> dict:
     from ..control.task_runtime import TaskCancelled, cooperative_sleep, raise_if_cancelled
 
     child_env = _clean_child_env()
+    proc: subprocess.Popen[str] | None = None
     try:
         raise_if_cancelled()
         proc = subprocess.Popen(
@@ -204,30 +230,8 @@ def _run_argv(argv: list[str], cwd: str | None, timeout_arg: int) -> dict:
         while proc.poll() is None:
             raise_if_cancelled()
             if time.time() >= deadline:
-                # F-04-11: SIGTERM, grace, then SIGKILL the whole process
-                # group (was: proc.kill() on the direct child only, so
-                # grandchildren in the session survived the timeout).
-                # terminate_process_group reuses the terminal_manager
-                # contract (2.0 s grace); no import cycle — that module
-                # imports stdlib only.
-                terminate_process_group(proc, grace_seconds=2.0)
-                # Windows second-chance: terminate_process_group runs
-                # taskkill /F /T once and returns without verifying; if
-                # the process survived, try once more before giving up.
-                if os.name == "nt" and proc.poll() is None:
-                    try:
-                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                                       shell=False, capture_output=True, timeout=5)
-                    except Exception:
-                        pass
-                    try:
-                        proc.wait(timeout=5)
-                    except Exception:
-                        pass
-                try:
-                    proc.communicate(timeout=5)
-                except Exception:
-                    pass
+                # F-04-11: SIGTERM, grace, then SIGKILL the whole process group.
+                _terminate_proc_tree(proc)
                 return {
                     "returncode": None,
                     "timeout": True,
@@ -242,6 +246,8 @@ def _run_argv(argv: list[str], cwd: str | None, timeout_arg: int) -> dict:
             "stderr": redact((err or "")[-20000:]),
         }
     except TaskCancelled:
+        if proc is not None and proc.poll() is None:
+            _terminate_proc_tree(proc)
         raise
     except FileNotFoundError:
         return {"returncode": None, "error": f"executable not found: {argv[0]}", "stdout": "", "stderr": ""}

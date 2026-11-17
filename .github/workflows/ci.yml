@@ -113,9 +113,14 @@ jobs:
         working-directory: windows-agent
         run: |
           cmake -B build -DAIBRIDGE_WITH_LIBDATACHANNEL=ON -DCMAKE_BUILD_TYPE=Release
-      - name: Build desktop agent
+      - name: Build desktop agent & C++ tests
         working-directory: windows-agent
-        run: cmake --build build --config Release --target ai_bridge_desktop -- /m
+        run: cmake --build build --config Release --target ai_bridge_desktop ai_bridge_tests ai_bridge_native ai_bridge_service -- /m
+      - name: Run C++ unit & integration tests
+        working-directory: windows-agent
+        env:
+          AIBRIDGE_ALLOW_HEADLESS_DXGI: "1"
+        run: .\build\Release\ai_bridge_tests.exe
       - name: Native PeerConnection ↔ plane E2E harness
         env:
           AIBRIDGE_DESKTOP_EXE: ${{ github.workspace }}\windows-agent\build\Release\ai_bridge_desktop.exe

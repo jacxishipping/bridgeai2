@@ -7,8 +7,10 @@
 #include "../src/mcp/mcp_executor.hpp"
 
 #include <cassert>
+#include <cstdlib>
 #include <iostream>
 #include <mutex>
+#include <string>
 #include <thread>
 
 // R-P0-09 / F08-14: assert() is stripped under NDEBUG, so checks use
@@ -59,6 +61,7 @@ int main() {
                 aibridge::security::SecureNamedPipe::SendAuthenticatedMessage(
                     hServer, "HEARTBEAT_PONG", "{\"status\":\"verified\"}", ipc_key
                 );
+                FlushFileBuffers(hServer);
                 DisconnectNamedPipe(hServer);
             }
             CloseHandle(hServer);
@@ -188,9 +191,15 @@ int main() {
 
         aibridge::capture::CapturedFrame frame;
         bool cap_ok = capturer.CaptureNextFrame(frame, 50, true);
-        CHECK(cap_ok && frame.valid);
-        CHECK(frame.width > 0 && frame.height > 0);
-        CHECK(frame.bgra_pixels.size() == static_cast<size_t>(frame.width) * static_cast<size_t>(frame.height) * 4);
+        const char* headless_env = std::getenv("AIBRIDGE_ALLOW_HEADLESS_DXGI");
+        const bool allow_headless = headless_env != nullptr && std::string(headless_env) == "1";
+        if (!cap_ok && allow_headless) {
+            std::cout << "  -> DXGI capture unavailable in headless session (skipped via AIBRIDGE_ALLOW_HEADLESS_DXGI=1)" << std::endl;
+        } else {
+            CHECK(cap_ok && frame.valid);
+            CHECK(frame.width > 0 && frame.height > 0);
+            CHECK(frame.bgra_pixels.size() == static_cast<size_t>(frame.width) * static_cast<size_t>(frame.height) * 4);
+        }
     }
 
     std::cout << "[5/7] Testing Media Foundation H.264 Encoding Pipeline (R-P0-09)..." << std::endl;
